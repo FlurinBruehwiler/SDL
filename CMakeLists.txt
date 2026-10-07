@@ -3534,6 +3534,11 @@ if(SDL_GPU)
       "${SDL3_SOURCE_DIR}/src/gpu/d3d12/*.c"
       "${SDL3_SOURCE_DIR}/src/gpu/d3d12/*.h"
     )
+    if(WINDOWS)
+      # DirectComposition presentation, see src/gpu/d3d12/SDL_gpu_d3d12_composition.h. dcomp.h is C++ only.
+      enable_language(CXX)
+      sdl_glob_sources("${SDL3_SOURCE_DIR}/src/gpu/d3d12/*.cpp")
+    endif()
     set(SDL_GPU_D3D12 1)
     set(HAVE_SDL_GPU TRUE)
   endif()

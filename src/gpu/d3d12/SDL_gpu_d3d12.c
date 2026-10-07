@@ -36,6 +36,14 @@
 
 #include "../SDL_sysgpu.h"
 
+#if !(defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES))
+#include "SDL_gpu_d3d12_composition.h"
+
+// Set on a window before claiming it to present through DirectComposition, see SDL_gpu_d3d12_composition.h.
+#define SDL_PROP_WINDOW_D3D12_COMPOSITION_BOOLEAN          "SDL.window.d3d12.composition"
+#define SDL_PROP_WINDOW_D3D12_COMPOSITION_BACKGROUND_NUMBER "SDL.window.d3d12.composition.background"
+#endif
+
 #ifdef __IDXGIInfoQueue_INTERFACE_DEFINED__
 #define HAVE_IDXGIINFOQUEUE
 #endif
@@ -882,6 +890,7 @@ typedef struct D3D12WindowData
     D3D12XBOX_FRAME_PIPELINE_TOKEN frameToken;
 #else
     IDXGISwapChain3 *swapchain;
+    D3D12Composition *composition;
 #endif
     SDL_GPUPresentMode present_mode;
     SDL_GPUSwapchainComposition swapchainComposition;
@@ -3468,7 +3477,12 @@ static D3D12Texture *D3D12_INTERNAL_CreateTexture(
     heapProperties.CreationNodeMask = 0; // We don't do multi-adapter operation
     heapProperties.VisibleNodeMask = 0;  // We don't do multi-adapter operation
 
+#if defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES)
     heapFlags = isSwapchainTexture ? D3D12_HEAP_FLAG_ALLOW_DISPLAY : D3D12_HEAP_FLAG_NONE;
+#else
+    // On desktop, swapchain textures are only created for DirectComposition presentation, which copies them on a D3D11 device.
+    heapFlags = isSwapchainTexture ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE;
+#endif
 
     if (createinfo->type != SDL_GPU_TEXTURETYPE_3D) {
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -6605,6 +6619,15 @@ static bool D3D12_INTERNAL_OnWindowResize(void *userdata, SDL_Event *e)
         data->needsSwapchainRecreate = true;
     }
 
+#if !(defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES))
+    if (e->type == SDL_EVENT_WINDOW_MOVED && e->window.windowID == SDL_GetWindowID(w)) {
+        data = D3D12_INTERNAL_FetchWindowData(w);
+        if (data && data->composition) {
+            D3D12_KeepCompositionContentInPlace(data->composition);
+        }
+    }
+#endif
+
     return true;
 }
 
@@ -6648,6 +6671,10 @@ static bool D3D12_SupportsSwapchainComposition(
 
     // Check the color space support if necessary
     if (swapchainComposition != SDL_GPU_SWAPCHAINCOMPOSITION_SDR) {
+        if (windowData->composition) {
+            return false;
+        }
+
         IDXGISwapChain3_CheckColorSpaceSupport(
             windowData->swapchain,
             SwapchainCompositionToColorSpace[swapchainComposition],
@@ -6789,6 +6816,112 @@ static bool D3D12_INTERNAL_ResizeSwapchain(
     return true;
 }
 #else
+static bool D3D12_INTERNAL_CreateCompositionTextures(
+    D3D12Renderer *renderer,
+    D3D12WindowData *windowData)
+{
+    int width, height;
+    SDL_GPUTextureCreateInfo createInfo;
+    void *resources[MAX_FRAMES_IN_FLIGHT];
+    D3D12Texture *texture;
+
+    SDL_GetWindowSizeInPixels(windowData->window, &width, &height);
+
+    SDL_zero(createInfo);
+    createInfo.type = SDL_GPU_TEXTURETYPE_2D;
+    createInfo.width = SDL_max(width, 1);
+    createInfo.height = SDL_max(height, 1);
+    createInfo.format = SwapchainCompositionToSDLTextureFormat[SDL_GPU_SWAPCHAINCOMPOSITION_SDR];
+    createInfo.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    createInfo.layer_count_or_depth = 1;
+    createInfo.num_levels = 1;
+
+    for (Uint32 i = 0; i < windowData->swapchainTextureCount; i += 1) {
+        texture = D3D12_INTERNAL_CreateTexture(renderer, &createInfo, true, "Swapchain");
+        if (!texture) {
+            return false;
+        }
+        texture->container = &windowData->textureContainers[i];
+        windowData->textureContainers[i].activeTexture = texture;
+        windowData->textureContainers[i].canBeCycled = false;
+        windowData->textureContainers[i].header.info = createInfo;
+        windowData->textureContainers[i].textureCapacity = 1;
+        windowData->textureContainers[i].textureCount = 1;
+        windowData->textureContainers[i].textures = &windowData->textureContainers[i].activeTexture;
+        resources[i] = texture->resource;
+    }
+
+    windowData->width = createInfo.width;
+    windowData->height = createInfo.height;
+
+    return D3D12_SetCompositionTextures(windowData->composition, resources, windowData->swapchainTextureCount);
+}
+
+static void D3D12_INTERNAL_DestroyCompositionTextures(
+    D3D12WindowData *windowData)
+{
+    for (Uint32 i = 0; i < windowData->swapchainTextureCount; i += 1) {
+        if (windowData->textureContainers[i].activeTexture) {
+            D3D12_INTERNAL_DestroyTexture(windowData->textureContainers[i].activeTexture);
+            windowData->textureContainers[i].activeTexture = NULL;
+        }
+    }
+}
+
+static bool D3D12_INTERNAL_CreateCompositionSwapchain(
+    D3D12Renderer *renderer,
+    D3D12WindowData *windowData,
+    SDL_GPUSwapchainComposition swapchainComposition,
+    SDL_GPUPresentMode presentMode)
+{
+    SDL_PropertiesID properties = SDL_GetWindowProperties(windowData->window);
+    HWND hwnd = (HWND)SDL_GetPointerProperty(properties, SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+
+    if (swapchainComposition != SDL_GPU_SWAPCHAINCOMPOSITION_SDR) {
+        SET_STRING_ERROR_AND_RETURN("DirectComposition presentation only supports SDR", false);
+    }
+
+    windowData->swapchainTextureCount = SDL_clamp(renderer->allowedFramesInFlight, 2, 3);
+    windowData->composition = D3D12_CreateComposition(
+        hwnd,
+        renderer->device,
+        (unsigned int)SDL_GetNumberProperty(properties, SDL_PROP_WINDOW_D3D12_COMPOSITION_BACKGROUND_NUMBER, 0));
+    if (!windowData->composition) {
+        return false;
+    }
+
+    if (!D3D12_INTERNAL_CreateCompositionTextures(renderer, windowData)) {
+        D3D12_INTERNAL_DestroyCompositionTextures(windowData);
+        D3D12_DestroyComposition(windowData->composition);
+        windowData->composition = NULL;
+        return false;
+    }
+
+    windowData->swapchain = NULL;
+    windowData->present_mode = presentMode;
+    windowData->swapchainComposition = swapchainComposition;
+    windowData->swapchainColorSpace = SwapchainCompositionToColorSpace[swapchainComposition];
+    windowData->frameCounter = 0;
+
+    for (Uint32 i = 0; i < 5; i += 1) {
+        SDL_GPU_FetchBlitPipeline(
+            renderer->sdlGPUDevice,
+            (SDL_GPUTextureType)i,
+            SwapchainCompositionToSDLTextureFormat[swapchainComposition],
+            renderer->blitVertexShader,
+            renderer->blitFrom2DShader,
+            renderer->blitFrom2DArrayShader,
+            renderer->blitFrom3DShader,
+            renderer->blitFromCubeShader,
+            renderer->blitFromCubeArrayShader,
+            &renderer->blitPipelines,
+            &renderer->blitPipelineCount,
+            &renderer->blitPipelineCapacity);
+    }
+
+    return true;
+}
+
 static bool D3D12_INTERNAL_InitializeSwapchainTexture(
     D3D12Renderer *renderer,
     IDXGISwapChain3 *swapchain,
@@ -6911,6 +7044,15 @@ static bool D3D12_INTERNAL_ResizeSwapchain(
     // Wait so we don't release in-flight views
     D3D12_Wait((SDL_GPURenderer *)renderer);
 
+    if (windowData->composition) {
+        D3D12_INTERNAL_DestroyCompositionTextures(windowData);
+        if (!D3D12_INTERNAL_CreateCompositionTextures(renderer, windowData)) {
+            return false;
+        }
+        windowData->needsSwapchainRecreate = false;
+        return true;
+    }
+
     // Release views and clean up
     for (Uint32 i = 0; i < windowData->swapchainTextureCount; i += 1) {
         D3D12_INTERNAL_ReleaseStagingDescriptorHandle(
@@ -6960,6 +7102,13 @@ static void D3D12_INTERNAL_DestroySwapchain(
     D3D12Renderer *renderer,
     D3D12WindowData *windowData)
 {
+    if (windowData->composition) {
+        D3D12_INTERNAL_DestroyCompositionTextures(windowData);
+        D3D12_DestroyComposition(windowData->composition);
+        windowData->composition = NULL;
+        return;
+    }
+
     // Release views and clean up
     for (Uint32 i = 0; i < windowData->swapchainTextureCount; i += 1) {
         D3D12_INTERNAL_ReleaseStagingDescriptorHandle(
@@ -6991,6 +7140,10 @@ static bool D3D12_INTERNAL_CreateSwapchain(
     IDXGISwapChain1 *swapchain;
     IDXGISwapChain3 *swapchain3;
     HRESULT res;
+
+    if (SDL_GetBooleanProperty(SDL_GetWindowProperties(windowData->window), SDL_PROP_WINDOW_D3D12_COMPOSITION_BOOLEAN, false)) {
+        return D3D12_INTERNAL_CreateCompositionSwapchain(renderer, windowData, swapchainComposition, presentMode);
+    }
 
     // Get the DXGI handle
 #ifdef _WIN32
@@ -7657,15 +7810,19 @@ static bool D3D12_INTERNAL_AcquireSwapchainTexture(
     renderer->device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, INFINITE, NULL, D3D12XBOX_WAIT_FRAME_EVENT_FLAG_NONE, &windowData->frameToken);
     swapchainIndex = windowData->frameCounter;
 #else
-    swapchainIndex = IDXGISwapChain3_GetCurrentBackBufferIndex(windowData->swapchain);
+    if (windowData->composition) {
+        swapchainIndex = windowData->frameCounter;
+    } else {
+        swapchainIndex = IDXGISwapChain3_GetCurrentBackBufferIndex(windowData->swapchain);
 
-    // Set the handle on the windowData texture data.
-    res = IDXGISwapChain_GetBuffer(
-        windowData->swapchain,
-        swapchainIndex,
-        D3D_GUID(D3D_IID_ID3D12Resource),
-        (void **)&windowData->textureContainers[swapchainIndex].activeTexture->resource);
-    CHECK_D3D12_ERROR_AND_RETURN("Could not acquire swapchain!", false);
+        // Set the handle on the windowData texture data.
+        res = IDXGISwapChain_GetBuffer(
+            windowData->swapchain,
+            swapchainIndex,
+            D3D_GUID(D3D_IID_ID3D12Resource),
+            (void **)&windowData->textureContainers[swapchainIndex].activeTexture->resource);
+        CHECK_D3D12_ERROR_AND_RETURN("Could not acquire swapchain!", false);
+    }
 #endif
 
     // Set up presentation
@@ -8081,6 +8238,17 @@ static bool D3D12_Submit(
             result = false;
         }
 #else
+        if (windowData->composition) {
+            if (!D3D12_PresentComposition(windowData->composition, renderer->commandQueue, presentData->swapchainImageIndex)) {
+                result = false;
+            }
+
+            windowData->inFlightFences[windowData->frameCounter] = (SDL_GPUFence *)d3d12CommandBuffer->inFlightFence;
+            (void)SDL_AtomicIncRef(&d3d12CommandBuffer->inFlightFence->referenceCount);
+            windowData->frameCounter = (windowData->frameCounter + 1) % windowData->swapchainTextureCount;
+            continue;
+        }
+
         // NOTE: flip discard always supported since DXGI 1.4 is required
         Uint32 syncInterval = 1;
         if (windowData->present_mode == SDL_GPU_PRESENTMODE_IMMEDIATE ||
