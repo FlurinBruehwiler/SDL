@@ -19,33 +19,32 @@
   3. This notice may not be removed or altered from any source distribution.
 */
 
-#ifndef SDL_gpu_d3d12_composition_h_
-#define SDL_gpu_d3d12_composition_h_
+#ifndef SDL_gpu_d3d12_bitblt_h_
+#define SDL_gpu_d3d12_bitblt_h_
 
-/* Presents D3D12 frames through a DirectComposition surface instead of a DXGI swapchain.
+/* Presents D3D12 frames through a bitblt-model DXGI swapchain instead of a flip-model one.
  *
  * DWM shows a flip-model swapchain's frames independently of window geometry changes, so a
- * window being resized shows stale, offset frames. DirectComposition surface updates are
- * applied together with the Commit that publishes them, which keeps the content in step with
- * the window. DirectComposition surfaces can only be drawn by D3D11, so each frame is rendered
- * into a shared D3D12 texture and copied into the surface by a D3D11 device on the same adapter.
+ * window being resized shows stale frames pinned to its top-left corner. A bitblt-model
+ * swapchain presents into the window's redirection surface, which DWM keeps in step with
+ * resizes, the same as GDI content. D3D12 only supports flip-model swapchains, so each frame
+ * is rendered into a shared D3D12 texture and copied into the back buffer of a D3D11 bitblt
+ * swapchain by a D3D11 device on the same adapter.
  */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef struct D3D12Composition D3D12Composition;
+typedef struct D3D12BitbltPresenter D3D12BitbltPresenter;
 
-D3D12Composition *D3D12_CreateComposition(void *hwnd, void *d3d12Device, unsigned int backgroundRgb);
+D3D12BitbltPresenter *D3D12_CreateBitbltPresenter(void *hwnd, void *d3d12Device);
 
-bool D3D12_SetCompositionTextures(D3D12Composition *composition, void **d3d12Resources, unsigned int count);
+bool D3D12_SetBitbltPresenterTextures(D3D12BitbltPresenter *presenter, void **d3d12Resources, unsigned int count);
 
-bool D3D12_PresentComposition(D3D12Composition *composition, void *d3d12CommandQueue, unsigned int index);
+bool D3D12_PresentBitblt(D3D12BitbltPresenter *presenter, void *d3d12CommandQueue, unsigned int index, unsigned int syncInterval);
 
-void D3D12_KeepCompositionContentInPlace(D3D12Composition *composition);
-
-void D3D12_DestroyComposition(D3D12Composition *composition);
+void D3D12_DestroyBitbltPresenter(D3D12BitbltPresenter *presenter);
 
 #ifdef __cplusplus
 }

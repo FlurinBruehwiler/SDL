@@ -37,11 +37,10 @@
 #include "../SDL_sysgpu.h"
 
 #if !(defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES))
-#include "SDL_gpu_d3d12_composition.h"
+#include "SDL_gpu_d3d12_bitblt.h"
 
-// Set on a window before claiming it to present through DirectComposition, see SDL_gpu_d3d12_composition.h.
-#define SDL_PROP_WINDOW_D3D12_COMPOSITION_BOOLEAN          "SDL.window.d3d12.composition"
-#define SDL_PROP_WINDOW_D3D12_COMPOSITION_BACKGROUND_NUMBER "SDL.window.d3d12.composition.background"
+// Set on a window before claiming it to present through a bitblt-model swapchain, see SDL_gpu_d3d12_bitblt.h.
+#define SDL_PROP_WINDOW_D3D12_BITBLT_BOOLEAN "SDL.window.d3d12.bitblt"
 #endif
 
 #ifdef __IDXGIInfoQueue_INTERFACE_DEFINED__
@@ -890,7 +889,7 @@ typedef struct D3D12WindowData
     D3D12XBOX_FRAME_PIPELINE_TOKEN frameToken;
 #else
     IDXGISwapChain3 *swapchain;
-    D3D12Composition *composition;
+    D3D12BitbltPresenter *bitblt;
 #endif
     SDL_GPUPresentMode present_mode;
     SDL_GPUSwapchainComposition swapchainComposition;
@@ -3480,7 +3479,7 @@ static D3D12Texture *D3D12_INTERNAL_CreateTexture(
 #if defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES)
     heapFlags = isSwapchainTexture ? D3D12_HEAP_FLAG_ALLOW_DISPLAY : D3D12_HEAP_FLAG_NONE;
 #else
-    // On desktop, swapchain textures are only created for DirectComposition presentation, which copies them on a D3D11 device.
+    // On desktop, swapchain textures are only created for bitblt presentation, which copies them on a D3D11 device.
     heapFlags = isSwapchainTexture ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE;
 #endif
 
@@ -6619,15 +6618,6 @@ static bool D3D12_INTERNAL_OnWindowResize(void *userdata, SDL_Event *e)
         data->needsSwapchainRecreate = true;
     }
 
-#if !(defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES))
-    if (e->type == SDL_EVENT_WINDOW_MOVED && e->window.windowID == SDL_GetWindowID(w)) {
-        data = D3D12_INTERNAL_FetchWindowData(w);
-        if (data && data->composition) {
-            D3D12_KeepCompositionContentInPlace(data->composition);
-        }
-    }
-#endif
-
     return true;
 }
 
@@ -6671,7 +6661,7 @@ static bool D3D12_SupportsSwapchainComposition(
 
     // Check the color space support if necessary
     if (swapchainComposition != SDL_GPU_SWAPCHAINCOMPOSITION_SDR) {
-        if (windowData->composition) {
+        if (windowData->bitblt) {
             return false;
         }
 
@@ -6816,7 +6806,7 @@ static bool D3D12_INTERNAL_ResizeSwapchain(
     return true;
 }
 #else
-static bool D3D12_INTERNAL_CreateCompositionTextures(
+static bool D3D12_INTERNAL_CreateBitbltTextures(
     D3D12Renderer *renderer,
     D3D12WindowData *windowData)
 {
@@ -6854,10 +6844,10 @@ static bool D3D12_INTERNAL_CreateCompositionTextures(
     windowData->width = createInfo.width;
     windowData->height = createInfo.height;
 
-    return D3D12_SetCompositionTextures(windowData->composition, resources, windowData->swapchainTextureCount);
+    return D3D12_SetBitbltPresenterTextures(windowData->bitblt, resources, windowData->swapchainTextureCount);
 }
 
-static void D3D12_INTERNAL_DestroyCompositionTextures(
+static void D3D12_INTERNAL_DestroyBitbltTextures(
     D3D12WindowData *windowData)
 {
     for (Uint32 i = 0; i < windowData->swapchainTextureCount; i += 1) {
@@ -6868,32 +6858,28 @@ static void D3D12_INTERNAL_DestroyCompositionTextures(
     }
 }
 
-static bool D3D12_INTERNAL_CreateCompositionSwapchain(
+static bool D3D12_INTERNAL_CreateBitbltSwapchain(
     D3D12Renderer *renderer,
     D3D12WindowData *windowData,
     SDL_GPUSwapchainComposition swapchainComposition,
     SDL_GPUPresentMode presentMode)
 {
-    SDL_PropertiesID properties = SDL_GetWindowProperties(windowData->window);
-    HWND hwnd = (HWND)SDL_GetPointerProperty(properties, SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+    HWND hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(windowData->window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
 
     if (swapchainComposition != SDL_GPU_SWAPCHAINCOMPOSITION_SDR) {
-        SET_STRING_ERROR_AND_RETURN("DirectComposition presentation only supports SDR", false);
+        SET_STRING_ERROR_AND_RETURN("Bitblt presentation only supports SDR", false);
     }
 
     windowData->swapchainTextureCount = SDL_clamp(renderer->allowedFramesInFlight, 2, 3);
-    windowData->composition = D3D12_CreateComposition(
-        hwnd,
-        renderer->device,
-        (unsigned int)SDL_GetNumberProperty(properties, SDL_PROP_WINDOW_D3D12_COMPOSITION_BACKGROUND_NUMBER, 0));
-    if (!windowData->composition) {
+    windowData->bitblt = D3D12_CreateBitbltPresenter(hwnd, renderer->device);
+    if (!windowData->bitblt) {
         return false;
     }
 
-    if (!D3D12_INTERNAL_CreateCompositionTextures(renderer, windowData)) {
-        D3D12_INTERNAL_DestroyCompositionTextures(windowData);
-        D3D12_DestroyComposition(windowData->composition);
-        windowData->composition = NULL;
+    if (!D3D12_INTERNAL_CreateBitbltTextures(renderer, windowData)) {
+        D3D12_INTERNAL_DestroyBitbltTextures(windowData);
+        D3D12_DestroyBitbltPresenter(windowData->bitblt);
+        windowData->bitblt = NULL;
         return false;
     }
 
@@ -7044,9 +7030,9 @@ static bool D3D12_INTERNAL_ResizeSwapchain(
     // Wait so we don't release in-flight views
     D3D12_Wait((SDL_GPURenderer *)renderer);
 
-    if (windowData->composition) {
-        D3D12_INTERNAL_DestroyCompositionTextures(windowData);
-        if (!D3D12_INTERNAL_CreateCompositionTextures(renderer, windowData)) {
+    if (windowData->bitblt) {
+        D3D12_INTERNAL_DestroyBitbltTextures(windowData);
+        if (!D3D12_INTERNAL_CreateBitbltTextures(renderer, windowData)) {
             return false;
         }
         windowData->needsSwapchainRecreate = false;
@@ -7102,10 +7088,10 @@ static void D3D12_INTERNAL_DestroySwapchain(
     D3D12Renderer *renderer,
     D3D12WindowData *windowData)
 {
-    if (windowData->composition) {
-        D3D12_INTERNAL_DestroyCompositionTextures(windowData);
-        D3D12_DestroyComposition(windowData->composition);
-        windowData->composition = NULL;
+    if (windowData->bitblt) {
+        D3D12_INTERNAL_DestroyBitbltTextures(windowData);
+        D3D12_DestroyBitbltPresenter(windowData->bitblt);
+        windowData->bitblt = NULL;
         return;
     }
 
@@ -7141,8 +7127,8 @@ static bool D3D12_INTERNAL_CreateSwapchain(
     IDXGISwapChain3 *swapchain3;
     HRESULT res;
 
-    if (SDL_GetBooleanProperty(SDL_GetWindowProperties(windowData->window), SDL_PROP_WINDOW_D3D12_COMPOSITION_BOOLEAN, false)) {
-        return D3D12_INTERNAL_CreateCompositionSwapchain(renderer, windowData, swapchainComposition, presentMode);
+    if (SDL_GetBooleanProperty(SDL_GetWindowProperties(windowData->window), SDL_PROP_WINDOW_D3D12_BITBLT_BOOLEAN, false)) {
+        return D3D12_INTERNAL_CreateBitbltSwapchain(renderer, windowData, swapchainComposition, presentMode);
     }
 
     // Get the DXGI handle
@@ -7810,7 +7796,7 @@ static bool D3D12_INTERNAL_AcquireSwapchainTexture(
     renderer->device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, INFINITE, NULL, D3D12XBOX_WAIT_FRAME_EVENT_FLAG_NONE, &windowData->frameToken);
     swapchainIndex = windowData->frameCounter;
 #else
-    if (windowData->composition) {
+    if (windowData->bitblt) {
         swapchainIndex = windowData->frameCounter;
     } else {
         swapchainIndex = IDXGISwapChain3_GetCurrentBackBufferIndex(windowData->swapchain);
@@ -8238,8 +8224,9 @@ static bool D3D12_Submit(
             result = false;
         }
 #else
-        if (windowData->composition) {
-            if (!D3D12_PresentComposition(windowData->composition, renderer->commandQueue, presentData->swapchainImageIndex)) {
+        if (windowData->bitblt) {
+            Uint32 bitbltSyncInterval = windowData->present_mode == SDL_GPU_PRESENTMODE_VSYNC ? 1 : 0;
+            if (!D3D12_PresentBitblt(windowData->bitblt, renderer->commandQueue, presentData->swapchainImageIndex, bitbltSyncInterval)) {
                 result = false;
             }
 
