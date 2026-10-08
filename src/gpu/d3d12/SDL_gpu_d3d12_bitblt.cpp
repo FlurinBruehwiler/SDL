@@ -34,18 +34,22 @@
 
 #define MAX_PRESENTER_TEXTURES 3
 
-struct D3D12BitbltPresenter
+struct D3D12BitbltDevice
 {
-    HWND hwnd;
-
     ID3D12Device *device12;
     ID3D12Fence *fence12;
     ID3D11Device5 *device11;
     ID3D11DeviceContext4 *context11;
     ID3D11Fence *fence11;
     UINT64 fenceValue;
-
     IDXGIFactory2 *factory;
+};
+
+struct D3D12BitbltPresenter
+{
+    D3D12BitbltDevice *device;
+    HWND hwnd;
+
     IDXGISwapChain1 *swapchain;
     UINT swapchainWidth;
     UINT swapchainHeight;
@@ -71,15 +75,7 @@ static bool Fail(const char *what, HRESULT hr)
     return false;
 }
 
-static void ReleaseTextures(D3D12BitbltPresenter *p)
-{
-    for (unsigned int i = 0; i < p->textureCount; i += 1) {
-        SafeRelease(p->textures[i]);
-    }
-    p->textureCount = 0;
-}
-
-static bool CreateD3D11Device(D3D12BitbltPresenter *p)
+static bool CreateD3D11Device(D3D12BitbltDevice *d)
 {
     typedef HRESULT(WINAPI * CreateDXGIFactory1Fn)(REFIID, void **);
     HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
@@ -101,12 +97,12 @@ static bool CreateD3D11Device(D3D12BitbltPresenter *p)
         return Fail("CreateDXGIFactory1", hr);
     }
     IDXGIAdapter *adapter = NULL;
-    hr = factory->EnumAdapterByLuid(p->device12->GetAdapterLuid(), __uuidof(IDXGIAdapter), (void **)&adapter);
+    hr = factory->EnumAdapterByLuid(d->device12->GetAdapterLuid(), __uuidof(IDXGIAdapter), (void **)&adapter);
     if (FAILED(hr)) {
         factory->Release();
         return Fail("EnumAdapterByLuid", hr);
     }
-    hr = factory->QueryInterface(__uuidof(IDXGIFactory2), (void **)&p->factory);
+    hr = factory->QueryInterface(__uuidof(IDXGIFactory2), (void **)&d->factory);
     factory->Release();
     if (FAILED(hr)) {
         adapter->Release();
@@ -121,13 +117,13 @@ static bool CreateD3D11Device(D3D12BitbltPresenter *p)
     if (FAILED(hr)) {
         return Fail("D3D11CreateDevice", hr);
     }
-    hr = device->QueryInterface(__uuidof(ID3D11Device5), (void **)&p->device11);
+    hr = device->QueryInterface(__uuidof(ID3D11Device5), (void **)&d->device11);
     device->Release();
     if (FAILED(hr)) {
         context->Release();
         return Fail("QueryInterface(ID3D11Device5)", hr);
     }
-    hr = context->QueryInterface(__uuidof(ID3D11DeviceContext4), (void **)&p->context11);
+    hr = context->QueryInterface(__uuidof(ID3D11DeviceContext4), (void **)&d->context11);
     context->Release();
     if (FAILED(hr)) {
         return Fail("QueryInterface(ID3D11DeviceContext4)", hr);
@@ -135,18 +131,18 @@ static bool CreateD3D11Device(D3D12BitbltPresenter *p)
     return true;
 }
 
-static bool CreateSharedFence(D3D12BitbltPresenter *p)
+static bool CreateSharedFence(D3D12BitbltDevice *d)
 {
-    HRESULT hr = p->device12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), (void **)&p->fence12);
+    HRESULT hr = d->device12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), (void **)&d->fence12);
     if (FAILED(hr)) {
         return Fail("ID3D12Device::CreateFence", hr);
     }
     HANDLE handle = NULL;
-    hr = p->device12->CreateSharedHandle(p->fence12, NULL, GENERIC_ALL, NULL, &handle);
+    hr = d->device12->CreateSharedHandle(d->fence12, NULL, GENERIC_ALL, NULL, &handle);
     if (FAILED(hr)) {
         return Fail("CreateSharedHandle(fence)", hr);
     }
-    hr = p->device11->OpenSharedFence(handle, __uuidof(ID3D11Fence), (void **)&p->fence11);
+    hr = d->device11->OpenSharedFence(handle, __uuidof(ID3D11Fence), (void **)&d->fence11);
     CloseHandle(handle);
     if (FAILED(hr)) {
         return Fail("OpenSharedFence", hr);
@@ -154,27 +150,42 @@ static bool CreateSharedFence(D3D12BitbltPresenter *p)
     return true;
 }
 
-static bool CreateSwapchain(D3D12BitbltPresenter *p)
+extern "C" void D3D12_DestroyBitbltDevice(D3D12BitbltDevice *d)
 {
-    DXGI_SWAP_CHAIN_DESC1 desc = {};
-    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    desc.SampleDesc.Count = 1;
-    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    desc.BufferCount = 1;
-    desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-    desc.Scaling = DXGI_SCALING_STRETCH;
-    desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-
-    HRESULT hr = p->factory->CreateSwapChainForHwnd(p->device11, p->hwnd, &desc, NULL, NULL, &p->swapchain);
-    if (FAILED(hr)) {
-        return Fail("CreateSwapChainForHwnd", hr);
+    if (!d) {
+        return;
     }
-    p->factory->MakeWindowAssociation(p->hwnd, DXGI_MWA_NO_WINDOW_CHANGES);
+    SafeRelease(d->factory);
+    SafeRelease(d->fence11);
+    SafeRelease(d->fence12);
+    SafeRelease(d->context11);
+    SafeRelease(d->device11);
+    SafeRelease(d->device12);
+    SDL_free(d);
+}
 
-    p->swapchain->GetDesc1(&desc);
-    p->swapchainWidth = desc.Width;
-    p->swapchainHeight = desc.Height;
-    return true;
+extern "C" D3D12BitbltDevice *D3D12_CreateBitbltDevice(void *d3d12Device)
+{
+    D3D12BitbltDevice *d = (D3D12BitbltDevice *)SDL_calloc(1, sizeof(D3D12BitbltDevice));
+    if (!d) {
+        return NULL;
+    }
+    d->device12 = (ID3D12Device *)d3d12Device;
+    d->device12->AddRef();
+
+    if (!CreateD3D11Device(d) || !CreateSharedFence(d)) {
+        D3D12_DestroyBitbltDevice(d);
+        return NULL;
+    }
+    return d;
+}
+
+static void ReleaseTextures(D3D12BitbltPresenter *p)
+{
+    for (unsigned int i = 0; i < p->textureCount; i += 1) {
+        SafeRelease(p->textures[i]);
+    }
+    p->textureCount = 0;
 }
 
 extern "C" void D3D12_DestroyBitbltPresenter(D3D12BitbltPresenter *p)
@@ -184,34 +195,45 @@ extern "C" void D3D12_DestroyBitbltPresenter(D3D12BitbltPresenter *p)
     }
     ReleaseTextures(p);
     SafeRelease(p->swapchain);
-    SafeRelease(p->factory);
-    SafeRelease(p->fence11);
-    SafeRelease(p->fence12);
-    SafeRelease(p->context11);
-    SafeRelease(p->device11);
-    SafeRelease(p->device12);
     SDL_free(p);
 }
 
-extern "C" D3D12BitbltPresenter *D3D12_CreateBitbltPresenter(void *hwnd, void *d3d12Device)
+extern "C" D3D12BitbltPresenter *D3D12_CreateBitbltPresenter(D3D12BitbltDevice *device, void *hwnd)
 {
     D3D12BitbltPresenter *p = (D3D12BitbltPresenter *)SDL_calloc(1, sizeof(D3D12BitbltPresenter));
     if (!p) {
         return NULL;
     }
+    p->device = device;
     p->hwnd = (HWND)hwnd;
-    p->device12 = (ID3D12Device *)d3d12Device;
-    p->device12->AddRef();
 
-    if (!CreateD3D11Device(p) || !CreateSharedFence(p) || !CreateSwapchain(p)) {
+    DXGI_SWAP_CHAIN_DESC1 desc = {};
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 1;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    desc.Scaling = DXGI_SCALING_STRETCH;
+    desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+
+    HRESULT hr = device->factory->CreateSwapChainForHwnd(device->device11, p->hwnd, &desc, NULL, NULL, &p->swapchain);
+    if (FAILED(hr)) {
+        Fail("CreateSwapChainForHwnd", hr);
         D3D12_DestroyBitbltPresenter(p);
         return NULL;
     }
+    device->factory->MakeWindowAssociation(p->hwnd, DXGI_MWA_NO_WINDOW_CHANGES);
+
+    p->swapchain->GetDesc1(&desc);
+    p->swapchainWidth = desc.Width;
+    p->swapchainHeight = desc.Height;
     return p;
 }
 
 extern "C" bool D3D12_SetBitbltPresenterTextures(D3D12BitbltPresenter *p, void **d3d12Resources, unsigned int count)
 {
+    D3D12BitbltDevice *d = p->device;
+
     ReleaseTextures(p);
     if (count > MAX_PRESENTER_TEXTURES) {
         return SDL_SetError("D3D12 bitblt presentation: too many textures");
@@ -220,12 +242,12 @@ extern "C" bool D3D12_SetBitbltPresenterTextures(D3D12BitbltPresenter *p, void *
     for (unsigned int i = 0; i < count; i += 1) {
         ID3D12Resource *resource = (ID3D12Resource *)d3d12Resources[i];
         HANDLE handle = NULL;
-        HRESULT hr = p->device12->CreateSharedHandle(resource, NULL, GENERIC_ALL, NULL, &handle);
+        HRESULT hr = d->device12->CreateSharedHandle(resource, NULL, GENERIC_ALL, NULL, &handle);
         if (FAILED(hr)) {
             ReleaseTextures(p);
             return Fail("CreateSharedHandle(texture)", hr);
         }
-        hr = p->device11->OpenSharedResource1(handle, __uuidof(ID3D11Texture2D), (void **)&p->textures[i]);
+        hr = d->device11->OpenSharedResource1(handle, __uuidof(ID3D11Texture2D), (void **)&p->textures[i]);
         CloseHandle(handle);
         if (FAILED(hr)) {
             ReleaseTextures(p);
@@ -243,6 +265,7 @@ extern "C" bool D3D12_SetBitbltPresenterTextures(D3D12BitbltPresenter *p, void *
 
 extern "C" bool D3D12_PresentBitblt(D3D12BitbltPresenter *p, void *d3d12CommandQueue, unsigned int index, unsigned int syncInterval)
 {
+    D3D12BitbltDevice *d = p->device;
     ID3D12CommandQueue *queue = (ID3D12CommandQueue *)d3d12CommandQueue;
     HRESULT hr;
 
@@ -260,25 +283,25 @@ extern "C" bool D3D12_PresentBitblt(D3D12BitbltPresenter *p, void *d3d12CommandQ
     }
 
     // The D3D11 copy waits on the GPU for the D3D12 work that rendered the frame...
-    p->fenceValue += 1;
-    hr = queue->Signal(p->fence12, p->fenceValue);
+    d->fenceValue += 1;
+    hr = queue->Signal(d->fence12, d->fenceValue);
     if (FAILED(hr)) {
         return Fail("ID3D12CommandQueue::Signal", hr);
     }
-    p->context11->Wait(p->fence11, p->fenceValue);
+    d->context11->Wait(d->fence11, d->fenceValue);
 
     ID3D11Texture2D *backbuffer = NULL;
     hr = p->swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&backbuffer);
     if (FAILED(hr)) {
         return Fail("GetBuffer", hr);
     }
-    p->context11->CopyResource(backbuffer, p->textures[index]);
+    d->context11->CopyResource(backbuffer, p->textures[index]);
     backbuffer->Release();
 
     // ...and later D3D12 work waits for the copy, so the texture is not rendered into again before it is read.
-    p->fenceValue += 1;
-    p->context11->Signal(p->fence11, p->fenceValue);
-    hr = queue->Wait(p->fence12, p->fenceValue);
+    d->fenceValue += 1;
+    d->context11->Signal(d->fence11, d->fenceValue);
+    hr = queue->Wait(d->fence12, d->fenceValue);
     if (FAILED(hr)) {
         return Fail("ID3D12CommandQueue::Wait", hr);
     }

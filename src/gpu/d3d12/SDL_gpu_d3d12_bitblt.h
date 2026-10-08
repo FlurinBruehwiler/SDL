@@ -30,15 +30,26 @@
  * resizes, the same as GDI content. D3D12 only supports flip-model swapchains, so each frame
  * is rendered into a shared D3D12 texture and copied into the back buffer of a D3D11 bitblt
  * swapchain by a D3D11 device on the same adapter.
+ *
+ * The D3D11 device belongs to the GPU device and is created with it when the
+ * SDL_GPU_D3D12_BITBLT hint is set, so its cost lands wherever the GPU device is created
+ * (often a background thread) instead of when a window is claimed.
  */
+
+#define SDL_HINT_GPU_D3D12_BITBLT "SDL_GPU_D3D12_BITBLT"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+typedef struct D3D12BitbltDevice D3D12BitbltDevice;
 typedef struct D3D12BitbltPresenter D3D12BitbltPresenter;
 
-D3D12BitbltPresenter *D3D12_CreateBitbltPresenter(void *hwnd, void *d3d12Device);
+D3D12BitbltDevice *D3D12_CreateBitbltDevice(void *d3d12Device);
+
+void D3D12_DestroyBitbltDevice(D3D12BitbltDevice *device);
+
+D3D12BitbltPresenter *D3D12_CreateBitbltPresenter(D3D12BitbltDevice *device, void *hwnd);
 
 bool D3D12_SetBitbltPresenterTextures(D3D12BitbltPresenter *presenter, void **d3d12Resources, unsigned int count);
 

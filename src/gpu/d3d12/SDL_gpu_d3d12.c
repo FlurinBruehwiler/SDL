@@ -933,6 +933,7 @@ struct D3D12Renderer
     IDXGIAdapter1 *adapter;
     SDL_SharedObject *dxgi_dll;
     SDL_SharedObject *dxgidebug_dll;
+    D3D12BitbltDevice *bitbltDevice;
 #endif
 #ifdef USE_PIX_RUNTIME
     SDL_SharedObject *winpixeventruntime_dll;
@@ -1825,6 +1826,11 @@ static void D3D12_DestroyDevice(SDL_GPUDevice *device)
     for (Sint32 i = renderer->claimedWindowCount - 1; i >= 0; i -= 1) {
         D3D12_ReleaseWindow((SDL_GPURenderer *)renderer, renderer->claimedWindows[i]->window);
     }
+
+#if !(defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES))
+    D3D12_DestroyBitbltDevice(renderer->bitbltDevice);
+    renderer->bitbltDevice = NULL;
+#endif
 
     D3D12_INTERNAL_DestroyRenderer(renderer);
     SDL_free(device);
@@ -6870,8 +6876,15 @@ static bool D3D12_INTERNAL_CreateBitbltSwapchain(
         SET_STRING_ERROR_AND_RETURN("Bitblt presentation only supports SDR", false);
     }
 
+    if (!renderer->bitbltDevice) {
+        renderer->bitbltDevice = D3D12_CreateBitbltDevice(renderer->device);
+        if (!renderer->bitbltDevice) {
+            return false;
+        }
+    }
+
     windowData->swapchainTextureCount = SDL_clamp(renderer->allowedFramesInFlight, 2, 3);
-    windowData->bitblt = D3D12_CreateBitbltPresenter(hwnd, renderer->device);
+    windowData->bitblt = D3D12_CreateBitbltPresenter(renderer->bitbltDevice, hwnd);
     if (!windowData->bitblt) {
         return false;
     }
@@ -10218,6 +10231,15 @@ static SDL_GPUDevice *D3D12_CreateDevice(bool debugMode, bool preferLowPower, SD
     if (SUCCEEDED(res) && shaderModel.HighestShaderModel >= D3D_SHADER_MODEL_6_0) {
         shaderFormats |= SDL_GPU_SHADERFORMAT_DXIL;
     }
+
+#if !(defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES))
+    if (SDL_GetHintBoolean(SDL_HINT_GPU_D3D12_BITBLT, false)) {
+        renderer->bitbltDevice = D3D12_CreateBitbltDevice(renderer->device);
+        if (!renderer->bitbltDevice) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_GPU, "Could not prepare bitblt presentation: %s", SDL_GetError());
+        }
+    }
+#endif
 
     ASSIGN_DRIVER(D3D12)
     result->driverData = (SDL_GPURenderer *)renderer;
