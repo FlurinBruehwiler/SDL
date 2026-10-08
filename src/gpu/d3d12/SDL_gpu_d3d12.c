@@ -6883,7 +6883,9 @@ static bool D3D12_INTERNAL_CreateBitbltSwapchain(
         }
     }
 
-    windowData->swapchainTextureCount = SDL_clamp(renderer->allowedFramesInFlight, 2, 3);
+    // Presenting already makes later D3D12 work wait for the copy out of the texture, so a second texture would not
+    // let frames overlap on the GPU, it would only hold another full-size image.
+    windowData->swapchainTextureCount = 1;
     windowData->bitblt = D3D12_CreateBitbltPresenter(renderer->bitbltDevice, hwnd);
     if (!windowData->bitblt) {
         return false;
