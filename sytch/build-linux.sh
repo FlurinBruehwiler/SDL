@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Builds the linux-x64 libSDL3.so that FDMF ships instead of the one PanGui.SDL3 bundles.
-# Audio is off, FDMF only initializes video. Vulkan stays, PanGui renders through the SDL GPU API.
+# Builds the linux-x64 libSDL3.so that Sytch ships instead of the one PanGui.SDL3 bundles.
+# Audio is off, Sytch only initializes video. Vulkan stays, PanGui renders through the SDL GPU API.
 # Needs SDL's build dependencies, see docs/README-linux.md.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
-build="$root/build-fdmf"
+build="$root/build-sytch"
 
 cmake -S "$root" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_AUDIO=OFF -DSDL_PIPEWIRE=OFF
 cmake --build "$build"
